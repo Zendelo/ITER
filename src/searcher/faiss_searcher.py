@@ -335,7 +335,7 @@ class FaissSearcher(BaseSearcher):
 
         with torch.no_grad():
             q_reps = self.model.encode_query(batch_dict)
-            return q_reps.cpu().detach().numpy().astype(np.float32)
+            return q_reps.float().cpu().detach().numpy()
 
     def search(self, query: str, k: int = 10) -> List[Dict[str, Any]]:
         if not all([self.retriever, self.model, self.tokenizer, self.lookup]):
