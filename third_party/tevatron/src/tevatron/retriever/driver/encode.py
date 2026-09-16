@@ -2,7 +2,6 @@ import logging
 import os
 import pickle
 import sys
-from contextlib import nullcontext
 
 import numpy as np
 from tqdm import tqdm
@@ -98,16 +97,15 @@ def main():
 
     for (batch_ids, batch) in tqdm(encode_loader):
         lookup_indices.extend(batch_ids)
-        with torch.amp.autocast('cuda') if training_args.fp16 or training_args.bf16 else nullcontext():
-            with torch.no_grad():
-                for k, v in batch.items():
-                    batch[k] = v.to(training_args.device)
-                if data_args.encode_is_query:
-                    model_output: EncoderOutput = model(query=batch)
-                    encoded.append(model_output.q_reps.cpu().detach().numpy())
-                else:
-                    model_output: EncoderOutput = model(passage=batch)
-                    encoded.append(model_output.p_reps.cpu().detach().numpy())
+        with torch.no_grad():
+            for k, v in batch.items():
+                batch[k] = v.to(training_args.device)
+            if data_args.encode_is_query:
+                model_output: EncoderOutput = model(query=batch)
+                encoded.append(model_output.q_reps.cpu().detach().numpy())
+            else:
+                model_output: EncoderOutput = model(passage=batch)
+                encoded.append(model_output.p_reps.cpu().detach().numpy())
 
     encoded = np.concatenate(encoded)
 

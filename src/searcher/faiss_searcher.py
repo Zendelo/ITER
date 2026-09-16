@@ -333,10 +333,9 @@ class FaissSearcher(BaseSearcher):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         batch_dict = {k: v.to(device) for k, v in batch_dict.items()}
 
-        with torch.amp.autocast(device):
-            with torch.no_grad():
-                q_reps = self.model.encode_query(batch_dict)
-                return q_reps.cpu().detach().numpy().astype(np.float32)
+        with torch.no_grad():
+            q_reps = self.model.encode_query(batch_dict)
+            return q_reps.cpu().detach().numpy().astype(np.float32)
 
     def search(self, query: str, k: int = 10) -> List[Dict[str, Any]]:
         if not all([self.retriever, self.model, self.tokenizer, self.lookup]):
@@ -415,12 +414,11 @@ class ReasonIrSearcher(FaissSearcher):
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        with torch.amp.autocast(device):
-            with torch.no_grad():
-                q_reps = self.model.encode(
-                    [query],
-                    instruction="<|user|>\nGiven a question, retrieve relevant passages that help answer the question\n<|embed|>\n",
-                )
+        with torch.no_grad():
+            q_reps = self.model.encode(
+                [query],
+                instruction="<|user|>\nGiven a question, retrieve relevant passages that help answer the question\n<|embed|>\n",
+            )
         q_reps = np.asarray(q_reps, dtype=np.float32)
 
         all_scores, psg_indices = self.retriever.search(q_reps, k)
