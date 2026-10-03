@@ -272,11 +272,11 @@ class SearchToolHandler(BaseTool):
 @register_tool("get_document", allow_overwrite=True)
 class GetDocumentToolHandler(BaseTool):
     name = "get_document"
-    def __init__(self, searcher):
+    def __init__(self, searcher, document_max_tokens: int = 512):
         super().__init__()
         self.searcher = searcher
         self.description = "Retrieve full document content based on provided docid(s)."
-        self.document_max_tokens = 512
+        self.document_max_tokens = document_max_tokens
         self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-Embedding-0.6B")
 
     def _truncate(self, text: str, max_tokens: int) -> str:

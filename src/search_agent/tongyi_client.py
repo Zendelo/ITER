@@ -14,10 +14,17 @@ from pathlib import Path
 from datetime import datetime, timezone
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
+from tongyi_utils.llm_backend import (
+    API_KEY_ENV, BASE_URL_ENV, BedrockBackend, FatalBackendError, VllmBackend, credentials,
+)
 from tongyi_utils.react_agent import MultiTurnReactAgent
 from tongyi_utils.tool_search import SearchToolHandler, GetDocumentToolHandler
 from searcher import SearcherType
 import re
+import threading
+
+ABORT = threading.Event()     # set when the LLM backend cannot continue (e.g. an expired API key)
+DEFAULT_MODEL = "Alibaba-NLP/Tongyi-DeepResearch-30B-A3B"
 
 
 logging.basicConfig(
@@ -95,13 +102,18 @@ def attach_tool_traces(result_array: list, tool_traces: list) -> list:
     return result_array
 
 
-def build_metadata(args, query: str) -> dict:
+def build_metadata(args, query: str, backend=None) -> dict:
     return {
         "model": args.model,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "presence_penalty": args.presence_penalty,
         "snippet_max_tokens": args.snippet_max_tokens,
+        "max_visit_tokens": args.max_visit_tokens,
+        "max_context_tokens": args.max_context_tokens,
+        "max_llm_calls": int(os.getenv("MAX_LLM_CALL_PER_RUN", 50)),
+        "attributed": args.attributed,
+        "llm_backend": (backend or getattr(args, "backend", VllmBackend())).report(),
         "k": args.k,
         "searcher_type": args.searcher_type,
         "query_style": args.query_style,
@@ -117,7 +129,7 @@ def build_metadata(args, query: str) -> dict:
     }
 
 
-def persist_response(output_dir: Path, query_id: str | None, query: str, result: dict, args):
+def persist_response(output_dir: Path, query_id: str | None, query: str, result: dict, args, backend=None):
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     # Key the filename on query_id so concurrent shards can never clobber each other
     # (query_ids are unique across shards); resume still matches the run_*.json glob.
@@ -129,7 +141,7 @@ def persist_response(output_dir: Path, query_id: str | None, query: str, result:
 
     result_array = parse_messages_to_result_array(result.get("messages", []))
     result_array = attach_tool_traces(result_array, result.get("tool_traces", []))
-    metadata = build_metadata(args, query)
+    metadata = build_metadata(args, query, backend)
 
     try:
         output_data = {
@@ -230,9 +242,10 @@ def process_tsv_dataset(tsv_path: str, searcher, llm_cfg: dict, args, output_dir
             dedup_search=args.dedup_search,
             dedup_pool_k=args.dedup_pool_k,
         )
-        get_document_handler = GetDocumentToolHandler(searcher=searcher)
+        get_document_handler = GetDocumentToolHandler(searcher=searcher, document_max_tokens=args.max_visit_tokens)
+        backend = args.backend.for_query()
         per_query_agent = MultiTurnReactAgent(
-            llm=llm_cfg,
+            llm={**llm_cfg, "backend": backend},
             function_list=["search", "get_document"],
             search_tool_handler=search_tool_handler,
             get_document_handler=get_document_handler,
@@ -243,9 +256,15 @@ def process_tsv_dataset(tsv_path: str, searcher, llm_cfg: dict, args, output_dir
             "planning_port": args.port
         }
 
+        if ABORT.is_set():
+            return
         try:
             result = per_query_agent._run(task_data, args.model)
-            persist_response(output_dir, qid, qtext, result, args)
+            persist_response(output_dir, qid, qtext, result, args, backend)
+        except FatalBackendError as exc:
+            # Not persisted: a failure record would mark the question as done and hide it from the resume.
+            logger.critical("Stopping the run: %s", exc)
+            ABORT.set()
         except Exception as exc:
             logger.error("Error processing query %s: %s", qid, exc)
             error_result = {
@@ -267,6 +286,8 @@ def process_tsv_dataset(tsv_path: str, searcher, llm_cfg: dict, args, output_dir
             
             for _ in as_completed(futures):
                 pbar.update(1)
+    if ABORT.is_set():
+        sys.exit("run stopped by a fatal LLM backend error; fix it and rerun to resume")
 
 
 def main():
@@ -278,7 +299,26 @@ def main():
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--presence_penalty", type=float, default=1.1)
     parser.add_argument("--num-threads", type=int, default=10, help="Number of parallel threads for processing queries")
-    parser.add_argument("--port", type=int, default=6008, help="LLM server port")
+    parser.add_argument("--port", type=int, default=6008, help="LLM server port (vllm backend)")
+    parser.add_argument("--llm-backend", choices=["vllm", "bedrock"], default="vllm",
+                        help="where the LLM is served; the agent, prompts and budgets are identical")
+    parser.add_argument("--attributed", action="store_true",
+                        help="attributed-answer condition: require [DocID:...] citations (prompt appended as in the released runs)")
+    parser.add_argument("--max-visit-tokens", type=int, default=512,
+                        help="get_document read cap: 512 (legacy runs) or 12000 (the 12k-read runs)")
+    parser.add_argument("--max-context-tokens", type=int, default=90000,
+                        help="context budget before the forced final answer: 90000 (legacy) or 120000 (12k-read runs)")
+    parser.add_argument("--tokenizer", default=DEFAULT_MODEL,
+                        help="tokenizer that counts the context budget; keep the Tongyi tokenizer for every LLM")
+    bedrock = parser.add_argument_group("bedrock backend (credentials come from the environment, not the command line)")
+    bedrock.add_argument("--env-file", default=None, help="dotenv file with the Bedrock settings")
+    bedrock.add_argument("--base-url-env", default=BASE_URL_ENV, help="variable holding the endpoint URL")
+    bedrock.add_argument("--api-key-env", default=API_KEY_ENV, help="variable holding the API key")
+    bedrock.add_argument("--seed", type=int, default=2026, help="request seed; dropped automatically if the endpoint rejects it")
+    bedrock.add_argument("--prefill-mode", choices=["instruction", "native"], default="instruction",
+                         help="how the final <answer> is forced: an instruction, or a real assistant prefill if supported")
+    bedrock.add_argument("--reasoning-effort", choices=["low", "medium", "high"], default=None)
+    bedrock.add_argument("--api-timeout", type=float, default=600.0)
     parser.add_argument("--store-raw", action="store_true", help="Store raw messages in the output JSON")
 
     # Server configuration arguments
@@ -308,6 +348,18 @@ def main():
 
     args = parser.parse_args()
 
+    if args.llm_backend == "bedrock":
+        args.model = args.model if args.model != DEFAULT_MODEL else os.getenv("BEDROCK_MODEL_ID", "")
+        if not args.model:
+            parser.error("--model (or $BEDROCK_MODEL_ID) must name the Bedrock model for --llm-backend bedrock")
+        credentials(args.env_file, args.base_url_env, args.api_key_env)   # fail before building a large index
+        args.backend = BedrockBackend(
+            env_file=args.env_file, base_url_env=args.base_url_env, api_key_env=args.api_key_env,
+            seed=args.seed, timeout=args.api_timeout, prefill_mode=args.prefill_mode,
+            reasoning_effort=args.reasoning_effort)
+    else:
+        args.backend = VllmBackend(args.port)
+
     model = args.model
     output_dir = Path(args.output_dir).expanduser().resolve()
     
@@ -327,7 +379,11 @@ def main():
             'top_p': args.top_p,
             'presence_penalty': args.presence_penalty
         },
-        'model_type': 'qwen_dashscope'
+        'model_type': 'qwen_dashscope',
+        'backend': args.backend,
+        'max_context_tokens': args.max_context_tokens,
+        'attributed': args.attributed,
+        'tokenizer': args.tokenizer,
     }
 
     query_str = args.query.strip()
@@ -350,7 +406,7 @@ def main():
         dedup_search=args.dedup_search,
         dedup_pool_k=args.dedup_pool_k,
     )
-    get_document_handler = GetDocumentToolHandler(searcher=searcher)
+    get_document_handler = GetDocumentToolHandler(searcher=searcher, document_max_tokens=args.max_visit_tokens)
     agent = MultiTurnReactAgent(
         llm=llm_cfg,
         function_list=["search", "get_document"],

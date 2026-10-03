@@ -24,6 +24,7 @@ from index_meta import check_meta                              # noqa: E402
 
 CLIENTS = {
     "tongyi": "src/search_agent/tongyi_client.py",
+    "tongyi-bedrock": "src/search_agent/tongyi_client.py",
     "qwen35": "src/search_agent/qwen35_client.py",
     "gptoss": "src/search_agent/gptoss_responses_client.py",
 }
@@ -51,6 +52,11 @@ def main():
     ap.add_argument("--searcher", default="faiss", choices=["faiss", "bm25"])
     ap.add_argument("--out", help="output directory (default: runs/<benchmark>_<backbone>_<setting>)")
     ap.add_argument("--port", type=int, default=6000, help="port vLLM is serving on")
+    ap.add_argument("--model", help="model id; required for --backbone bedrock (the Bedrock model id)")
+    ap.add_argument("--attributed", action="store_true", help="the attributed-answer condition (tongyi clients)")
+    ap.add_argument("--max-visit-tokens", type=int, help="get_document read cap (tongyi clients; 12000 for the 12k-read runs)")
+    ap.add_argument("--max-context-tokens", type=int, help="context budget (tongyi clients; 120000 for the 12k-read runs)")
+    ap.add_argument("--env-file", help="dotenv file with the Bedrock settings (bedrock backbone)")
     ap.add_argument("--gpu-util", type=float, default=0.92)
     ap.add_argument("--threads", type=int, default=2, help="concurrent questions")
     ap.add_argument("--dedup", action="store_true",
@@ -63,6 +69,9 @@ def main():
     args = ap.parse_args()
 
     setting, backbone, bench = SETTINGS[args.setting], BACKBONES[args.backbone], BENCHMARKS[args.benchmark]
+    model = args.model or backbone.model
+    if not model:
+        sys.exit("--backbone bedrock needs --model <Bedrock model id>")
 
     if args.print_server:
         print(" ".join(server_command(args.backbone, args.port, args.gpu_util)))
@@ -87,7 +96,7 @@ def main():
            "--searcher-type", args.searcher,
            "--index-path", index,
            "--query", bench.queries,
-           "--model", backbone.model,
+           "--model", model,
            "--num-threads", str(args.threads),
            "--snippet-max-tokens", str(SERVING["snippet_max_tokens"]),
            "--k", str(SERVING["k"]),
@@ -104,8 +113,24 @@ def main():
     if args.dedup:
         cmd += ["--dedup-search", "--dedup-pool-k", str(SERVING["dedup_pool_k"])]
 
+    # ---- the conditions of the released runs, shared by both Tongyi clients ----
+    if backbone.client in ("tongyi", "tongyi-bedrock"):
+        if args.attributed:
+            cmd += ["--attributed"]
+        if args.max_visit_tokens:
+            cmd += ["--max-visit-tokens", str(args.max_visit_tokens)]
+        if args.max_context_tokens:
+            cmd += ["--max-context-tokens", str(args.max_context_tokens)]
+
     # ---- per-client generation settings ----
-    if backbone.client == "tongyi":
+    if backbone.client == "tongyi-bedrock":
+        cmd += ["--llm-backend", "bedrock",
+                "--temperature", str(SERVING["temperature"]),
+                "--top_p", str(SERVING["top_p"]),
+                "--presence_penalty", str(SERVING["presence_penalty"])]
+        if args.env_file:
+            cmd += ["--env-file", args.env_file]
+    elif backbone.client == "tongyi":
         cmd += ["--port", str(args.port),
                 "--temperature", str(SERVING["temperature"]),
                 "--top_p", str(SERVING["top_p"]),

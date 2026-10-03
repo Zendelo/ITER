@@ -65,7 +65,25 @@ If the number of llm calls exceeds the limit, if reached the maximum context len
 """
 
 
+from tongyi_utils.llm_backend import VllmBackend
 from tongyi_utils.tool_search import SearchToolHandler
+
+# The attributed-answer condition (RMIT-ADMS/agentic-search-trajectories dataset card): appended to the
+# system prompt, to the user question and to the forced final-answer turn.
+ATTRIBUTION_REQUIREMENT = """
+
+# ATTRIBUTION REQUIREMENT
+Your final answer must be attributed to the documents you retrieved. Inside the <answer></answer> tags:
+1. State the direct answer first, on its own line.
+2. Then give a short justification in which every factual claim is followed by the DocID(s) of the document(s) that support it, in square brackets, e.g. [DocID:12345] or [DocID:12345, DocID:67890].
+3. Cite only DocIDs that appeared in your search results or that you retrieved with get_document in this conversation. Never invent a DocID. Prefer documents you have read in full with get_document.
+4. If a claim is not supported by any retrieved document, say so explicitly instead of citing.
+"""
+ATTRIBUTION_REMINDER = (
+    "\n\nIn your final <answer>, give the direct answer first, then support every  factual claim with the "
+    "DocID(s) of the retrieved documents it comes from, in the  form [DocID:12345]. Cite only DocIDs you "
+    "actually saw in this conversation."
+)
 
 OBS_START = '<tool_response>'
 OBS_END = '\n</tool_response>'
@@ -104,83 +122,24 @@ class MultiTurnReactAgent(FnCallAgent):
         self.get_document_tool = get_document_handler
         self.max_generation = 4096
         self.enable_thinking = True
-        self.tokenizer = AutoTokenizer.from_pretrained(self.llm_local_path) 
+        # Where the model is served is the only thing that may differ between arms; everything below
+        # (prompts, caps, budgets) is the same for every backend. Defaults reproduce the original agent.
+        self.backend = llm.get("backend") or VllmBackend()
+        self.max_context_tokens = llm.get("max_context_tokens", 90000)
+        self.attributed = bool(llm.get("attributed", False))
+        # Context is always counted with the Tongyi tokenizer, so the budget means the same for any LLM.
+        self.tokenizer = AutoTokenizer.from_pretrained(llm.get("tokenizer") or self.llm_local_path)
 
     
     def call_server(self, msgs, planning_port, max_tries=10, prefill=None):
-        """prefill: if set, hard-forces the assistant's reply to start with this exact
-        string via vLLM's `continue_final_message` (assistant-prefill) -- the model
-        physically cannot emit a <tool_call> first, unlike a text-only "please answer
-        now" nudge which it can (and does) ignore. vLLM returns only the continuation,
-        so the caller gets `prefill + continuation` back.
+        """One LLM turn through the configured backend: `(content, finish_reason)`.
+
+        `prefill`, if set, forces the reply to start with that string (the forced final `<answer>`).
         """
-
-        openai_api_key = "EMPTY"
-        openai_api_base = f"http://127.0.0.1:{planning_port}/v1"
-
-        client = OpenAI(
-            api_key=openai_api_key,
-            base_url=openai_api_base,
-            timeout=600.0,
+        return self.backend.generate(
+            msgs, model=self.model, max_tokens=self.max_generation, generate_cfg=self.llm_generate_cfg,
+            enable_thinking=self.enable_thinking, prefill=prefill, port=planning_port, max_tries=max_tries,
         )
-
-        base_sleep_time = 1
-
-        call_msgs = msgs
-        extra_body = {
-            "chat_template_kwargs": {
-                "enable_thinking": self.enable_thinking  # 或 True
-            }
-        }
-        if prefill:
-            call_msgs = msgs + [{"role": "assistant", "content": prefill}]
-            extra_body["continue_final_message"] = True
-            extra_body["add_generation_prompt"] = False
-
-        for attempt in range(max_tries):
-            try:
-                chat_response = client.chat.completions.create(
-                    model=self.model,
-                    messages=call_msgs,
-                    stop=["\n<tool_response>", "<tool_response>"],
-                    temperature=self.llm_generate_cfg.get('temperature', 0.6),
-                    top_p=0.95,
-                    logprobs=True,
-                    max_tokens=self.max_generation,
-                    seed=2026,
-                    presence_penalty=self.llm_generate_cfg.get('presence_penalty', 1.1),
-                    extra_body=extra_body,
-                )
-                content = chat_response.choices[0].message.content
-                finish_reason = chat_response.choices[0].finish_reason
-
-                if content and content.strip():
-                    if prefill:
-                        content = prefill + content
-                    return content.strip(), finish_reason
-                else:
-                    logger.warning(
-                        "Attempt %s received an empty response. enable_thinking=%s message=%s",
-                        attempt + 1,
-                        self.enable_thinking,
-                        chat_response.choices[0].message,
-                    )
-
-            except (APIError, APIConnectionError, APITimeoutError) as e:
-                logger.warning("Attempt %s failed with an API/network error: %s", attempt + 1, e)
-            except Exception as e:
-                logger.warning("Attempt %s failed with an unexpected error: %s", attempt + 1, e)
-
-            if attempt < max_tries - 1:
-                sleep_time = base_sleep_time * (2 ** attempt) + random.uniform(0, 1)
-                sleep_time = min(sleep_time, 30) 
-                
-                logger.info("Retrying in %.2f seconds...", sleep_time)
-                time.sleep(sleep_time)
-            else:
-                logger.error("All retry attempts have been exhausted. The call has failed.")
-        
-        return f"vllm server error!!!", "error"
 
     def count_tokens(self, messages, model="gpt-4o"):
         input_ids = self.tokenizer.apply_chat_template(
@@ -214,7 +173,11 @@ class MultiTurnReactAgent(FnCallAgent):
         system_prompt = SYSTEM_PROMPT_SEARCH_ONLY
         if self.search_tool and getattr(self.search_tool, "dedup_search", False):
             system_prompt += DEDUP_NOTICE
-        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": question}]
+        user_prompt = question
+        if self.attributed:
+            system_prompt += ATTRIBUTION_REQUIREMENT
+            user_prompt += ATTRIBUTION_REMINDER
+        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
         num_llm_calls_available = MAX_LLM_CALL_PER_RUN
         round = 0
         pending_visit = False  # a doc was just read; its post-visit reasoning is the next think
@@ -288,11 +251,13 @@ class MultiTurnReactAgent(FnCallAgent):
                 termination = 'answer'
                 break
 
-            max_tokens = 90000
+            max_tokens = self.max_context_tokens
             token_count = self.count_tokens(messages)
 
             if num_llm_calls_available <= 0 or token_count > max_tokens:
                 messages[-1]['content'] = 'Retrieval complete. You are forbidden to call any tools now. Based only on the information already collected above, provide your best final answer.'
+                if self.attributed:
+                    messages[-1]['content'] += ATTRIBUTION_REMINDER
                 self.max_generation = 10000
                 content, finish_reason = self.call_server(messages, planning_port, prefill="<answer>")
                 messages.append({"role": "assistant", "content": content.strip()})

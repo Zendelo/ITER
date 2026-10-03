@@ -95,6 +95,9 @@ BACKBONES = {
     "qwen3.5-9b":  Backbone("Qwen/Qwen3.5-9B",  "qwen35", vllm_flags=["--gdn-prefill-backend", "triton"]),
     "qwen3.5-27b": Backbone("Qwen/Qwen3.5-27B", "qwen35", vllm_flags=["--gdn-prefill-backend", "triton"]),
     "qwen3.6-27b": Backbone("Qwen/Qwen3.6-27B", "qwen35", vllm_flags=["--gdn-prefill-backend", "triton"]),
+    # API-served on Amazon Bedrock: the Tongyi ReAct agent with only the LLM swapped (docs/bedrock.md).
+    # The Bedrock model id is passed with --model, so no id is baked into the paper's configuration.
+    "bedrock": Backbone("", "tongyi-bedrock"),
     "gptoss-120b": Backbone("openai/gpt-oss-120b", "gptoss",
                             vllm_flags=["--tensor-parallel-size", "2", "--max-num-seqs", "16",
                                         "--enforce-eager", "--disable-custom-all-reduce"]),

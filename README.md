@@ -116,6 +116,11 @@ uv pip install --no-build-isolation flash-attn
 BM25 additionally needs Java 21+ (`conda install -c conda-forge openjdk=21`)
 and `uv pip install pyserini`.
 
+## API-served LLM (Amazon Bedrock)
+
+The Tongyi ReAct agent can run on a Bedrock-served LLM instead of local vLLM, with every other
+condition held fixed; see [docs/bedrock.md](docs/bedrock.md) (`--llm-backend bedrock`).
+
 ## Released artifacts
 
 | | |
