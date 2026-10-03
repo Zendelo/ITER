@@ -24,3 +24,6 @@ logs/
 
 # Model cards staged for Hugging Face, not part of the code release
 .hf-cards/
+
+# Local credentials (docs/bedrock.md)
+.env
