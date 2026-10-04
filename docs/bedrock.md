@@ -1,12 +1,12 @@
 # Running the agent on an API-served LLM (Amazon Bedrock)
 
 The Tongyi ReAct agent (`src/search_agent/tongyi_client.py`) can use an LLM served by
-Amazon Bedrock instead of a local vLLM server. **Only the LLM changes.** The system prompt,
+Amazon Bedrock instead of a local vLLM server. **The agent tools and loop retain their released settings.** The system prompt,
 the `search` / `get_document` tools, the per-turn reasoning caps (4096 / 2048 / 1024 tokens),
 the 50-call budget, the context budget, the forced final `<answer>` turn, the retrievers and the
-trajectory JSON are the same, so a Bedrock arm is comparable with the runs in
+trajectory JSON are the same, so a Bedrock arm can be analysed alongside the runs in
 [RMIT-ADMS/agentic-search-trajectories](https://huggingface.co/datasets/RMIT-ADMS/agentic-search-trajectories)
-and feeds stages 2, 3 and 5 unchanged. The default (`--llm-backend vllm`) is the original behaviour.
+and feeds stages 2, 3 and 5 unchanged. Hosted API adaptations and optional parser repair must be reported as separate conditions. The default (`--llm-backend vllm`) is the original behaviour.
 
 ## Credentials
 
@@ -15,10 +15,14 @@ command line. Put these in the environment or in a dotenv file passed with `--en
 (see `.env.example`):
 
 ```text
-BEDROCK_MANTLE_OPENAI_BASE_URL   e.g. https://bedrock-mantle.us-west-2.api.aws  (with or without /v1)
+BEDROCK_MANTLE_OPENAI_BASE_URL   e.g. https://bedrock-mantle.us-west-2.api.aws/v1
 BEDROCK_MANTLE_OPENAI_API_KEY    a Bedrock API key; short-lived keys expire
 BEDROCK_MODEL_ID                 optional default for --model
 ```
+
+Use the endpoint for the region in which the key was issued. For Sydney this is
+`https://bedrock-mantle.ap-southeast-2.api.aws/v1`. Exported environment values
+take precedence over `--env-file`; clear stale values before switching files.
 
 The client checks them before loading an index. If the key expires mid-run the run stops
 without writing failure records, so the finished questions are skipped when you rerun after
@@ -80,8 +84,32 @@ API seconds of that question, so marginal agent cost can be priced per topic.
 index): `pip install pytest openai httpx python-dotenv tqdm json5 qwen-agent soundfile transformers
 tiktoken numpy` then `pytest tests`.
 
-## Not yet verified against live Bedrock
+## Optional GLM tool-call repair
 
-The implementation was developed against the scripted endpoint. The Bedrock key available when it
-was written had expired, so a live smoke test (one question, then a few) is still to do with a fresh
-key and a model id that supports a long multi-turn chat.
+`--repair-tool-calls` enables the Bedrock adapter's conservative repair of GLM
+near-miss text calls. It is disabled by default and leaves the original agent loop
+unchanged. Record this as a separate experimental variant in a fresh output
+directory; preserve unrepaired baselines.
+
+Reviewed implementation `49b9d2f295278ca61d6f53e38ec9faaaed36afa3` preserves
+controller-accepted replies and complete argument values, accepts only the known
+`search(query)` and `get_document(docid)` forms, and rejects duplicate or ambiguous
+incomplete arguments. It executes only the first recovered call. Repair kinds
+are counted in `metadata.llm_backend.tool_call_repairs`. The earlier `d833cef`
+implementation had unsafe recovery cases and should not be used for new runs.
+
+Repair does not guarantee successful tools or correct answers. Unterminated
+argument values remain unrepaired, unclosed answers remain outside its scope,
+and corrupted document IDs can still produce failed reads. Native `invalid_json`
+counters alone do not identify every silently ignored malformed reply.
+
+## Live verification
+
+GLM-5 and Kimi K2.5 have run on Mantle in the trajectories-vs-judgments project.
+GLM-5's reviewed repair has also been exercised in a separately labelled
+full-corpus run. These observations validate backend operation; they do not
+establish answer quality or equivalence with the original local model.
+
+See that project's experiment tracker for run provenance, tool audits and cost.
+This backend records token usage but does not itself enforce a dollar budget;
+paid batch launchers must enforce the authorised allocation externally.
