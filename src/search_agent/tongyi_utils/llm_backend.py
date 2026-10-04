@@ -11,10 +11,14 @@ cannot do like vLLM:
   recorded in `report()["dropped_params"]`, so a run states exactly where it deviated.
 * A model that returns its reasoning in a separate field has it put back inside `<think>` tags,
   the form every downstream stage (trajectory parsing, ITER's `i6`/`i7` queries) reads.
+* With `repair_tool_calls`, a near-miss tool call (GLM's native tags, an unclosed tag, several calls in
+  one reply) is rewritten into the Tongyi form before the agent reads it; each repair is counted in
+  `report()["tool_call_repairs"]`. Off by default, so the request and reply path stay as released.
 * The assistant prefill used to force the final `<answer>` is an instruction by default
   (`prefill_mode="instruction"`); `native` sends a real assistant prefill if the endpoint allows it.
 """
 
+import collections
 import logging
 import os
 import random
@@ -32,6 +36,8 @@ from openai import (
     OpenAI,
     RateLimitError,
 )
+
+from tongyi_utils.tool_call_repair import repair_tool_call
 
 logger = logging.getLogger(__name__)
 
@@ -126,11 +132,13 @@ class BedrockBackend:
 
     def __init__(self, *, env_file=None, base_url_env=BASE_URL_ENV, api_key_env=API_KEY_ENV,
                  seed: int | None = 2026, timeout: float = 600.0, prefill_mode: str = "instruction",
-                 reasoning_effort: str | None = None, client: Any = None):
+                 reasoning_effort: str | None = None, repair_tool_calls: bool = False, client: Any = None):
         if prefill_mode not in ("instruction", "native"):
             raise ValueError("prefill_mode must be 'instruction' or 'native'")
         self.env_file, self.base_url_env, self.api_key_env = env_file, base_url_env, api_key_env
         self.seed, self.timeout, self.prefill_mode, self.reasoning_effort = seed, timeout, prefill_mode, reasoning_effort
+        self.repair_tool_calls = repair_tool_calls
+        self.repairs: collections.Counter = collections.Counter()
         self._client = client
         self._lock = threading.Lock()
         self.dropped: set[str] = set()
@@ -145,6 +153,7 @@ class BedrockBackend:
         view.__dict__.update(self.__dict__)
         view.usage = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "seconds": 0.0}
         view._lock = threading.Lock()
+        view.repairs = collections.Counter()
         view.client = self.client          # one shared client, rebuilt for every view on key refresh
         view.parent = self
         return view
@@ -152,6 +161,7 @@ class BedrockBackend:
     def report(self) -> dict:
         return {"backend": "bedrock-mantle", "dropped_params": sorted(self.dropped),
                 "max_tokens_field": self.max_tokens_field, "prefill_mode": self.prefill_mode,
+                "tool_call_repairs": dict(self.repairs) if self.repair_tool_calls else None,
                 "usage": {**self.usage, "seconds": round(self.usage["seconds"], 3)}}
 
     def client(self, refresh: bool = False) -> OpenAI:
@@ -235,6 +245,9 @@ class BedrockBackend:
                         self.usage["completion_tokens"] += counts.completion_tokens or 0
                 choice = response.choices[0]
                 content = merged_content(choice.message)
+                if self.repair_tool_calls:
+                    content, repaired = repair_tool_call(content)
+                    self.repairs.update(repaired)
                 if content.strip():
                     return (prefill + content if prefill and self.prefill_mode == "native" else content).strip(), choice.finish_reason
                 logger.warning("Attempt %s received an empty response: %s", attempt + 1, choice.message)

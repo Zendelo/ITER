@@ -318,6 +318,8 @@ def main():
     bedrock.add_argument("--prefill-mode", choices=["instruction", "native"], default="instruction",
                          help="how the final <answer> is forced: an instruction, or a real assistant prefill if supported")
     bedrock.add_argument("--reasoning-effort", choices=["low", "medium", "high"], default=None)
+    bedrock.add_argument("--repair-tool-calls", action="store_true",
+                         help="rewrite near-miss tool calls (GLM native tags, unclosed or repeated calls) into the Tongyi form")
     bedrock.add_argument("--api-timeout", type=float, default=600.0)
     parser.add_argument("--store-raw", action="store_true", help="Store raw messages in the output JSON")
 
@@ -356,7 +358,7 @@ def main():
         args.backend = BedrockBackend(
             env_file=args.env_file, base_url_env=args.base_url_env, api_key_env=args.api_key_env,
             seed=args.seed, timeout=args.api_timeout, prefill_mode=args.prefill_mode,
-            reasoning_effort=args.reasoning_effort)
+            reasoning_effort=args.reasoning_effort, repair_tool_calls=args.repair_tool_calls)
     else:
         args.backend = VllmBackend(args.port)
 
